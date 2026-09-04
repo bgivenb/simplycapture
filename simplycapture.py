@@ -1,292 +1,290 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox
-from tkinter import ttk
-import cv2
-import numpy as np
-import threading
-import keyboard
-import time
-import datetime
+"""Simply Capture: a focused desktop region recorder."""
+
+from __future__ import annotations
+
 import os
+from pathlib import Path
+import queue
+import sys
+import threading
+from time import monotonic, sleep
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from typing import Optional
+
+import cv2
 import mss
+import numpy as np
 from PIL import Image, ImageTk
 
+from capture_core import CaptureRegion, normalize_region, recording_path, validate_fps
 
-def resource_path(relative_path):
-    """ this is the absolute path to resource, works for dev and for PyInstaller """
-    try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
 
-    return os.path.join(base_path, relative_path)
+def resource_path(filename: str) -> Path:
+    """Resolve resources in source checkouts and PyInstaller bundles."""
 
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return bundle_root / filename
+
+
+class CaptureWorker(threading.Thread):
+    def __init__(
+        self,
+        region: CaptureRegion,
+        output_file: Path,
+        fps: float,
+        stop_event: threading.Event,
+        events: queue.Queue,
+    ):
+        super().__init__(name="capture-worker", daemon=True)
+        self.region = region
+        self.output_file = output_file
+        self.fps = fps
+        self.stop_event = stop_event
+        self.events = events
+
+    def run(self):
+        writer = cv2.VideoWriter(
+            str(self.output_file),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            self.fps,
+            (self.region.width, self.region.height),
+        )
+        if not writer.isOpened():
+            writer.release()
+            self.events.put(("error", "The MP4 encoder could not be opened."))
+            return
+
+        frames = 0
+        interval = 1.0 / self.fps
+        deadline = monotonic()
+        try:
+            with mss.mss() as screen:
+                while not self.stop_event.is_set():
+                    image = np.asarray(screen.grab(self.region.as_mss()))
+                    writer.write(cv2.cvtColor(image, cv2.COLOR_BGRA2BGR))
+                    frames += 1
+                    deadline += interval
+                    sleep(max(0.0, deadline - monotonic()))
+        except Exception as exc:
+            self.events.put(("error", f"Recording failed: {exc}"))
+        else:
+            self.events.put(("saved", self.output_file, frames))
+        finally:
+            writer.release()
 
 
 class ScreenRecorder:
-    def __init__(self, root):
+    def __init__(self, root: tk.Tk):
         self.root = root
-        self.recording = False
-        self.region = None
-        self.save_folder = os.getcwd()  # Default to current directory
-        self.recording_thread = None
-        self.fps = 20.0  # Frames per second
+        self.region: Optional[CaptureRegion] = None
+        self.output_directory = Path.home() / "Videos"
+        if not self.output_directory.is_dir():
+            self.output_directory = Path.cwd()
+        self.stop_event = threading.Event()
+        self.worker: Optional[CaptureWorker] = None
+        self.events: queue.Queue = queue.Queue()
+        self.selection_window: Optional[tk.Toplevel] = None
+        self.selection_canvas: Optional[tk.Canvas] = None
+        self.selection_start = (0, 0)
+        self.selection_rectangle = None
 
-        # Initialize images
-        self.load_images()
+        self._load_icons()
+        self._build_ui()
+        self.root.bind_all("<Control-Shift-S>", self.toggle_recording)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.after(100, self._poll_events)
 
-        # Initialize GUI
-        self.init_gui()
+    @property
+    def recording(self) -> bool:
+        return self.worker is not None and self.worker.is_alive() and not self.stop_event.is_set()
 
-        # Register hotkey to stop recording
-        keyboard.add_hotkey('ctrl+shift+s', self.stop_recording)
+    def _load_icon(self, filename: str):
+        path = resource_path(filename)
+        if not path.is_file():
+            return None
+        image = Image.open(path).resize((112, 112), Image.Resampling.LANCZOS)
+        return ImageTk.PhotoImage(image)
 
-    def load_images(self):
-        try:
-            # Load and resize the start icon
-            self.start_icon = Image.open(resource_path("assets/icon.png"))
-            self.start_icon = self.start_icon.resize((128, 128), Image.Resampling.LANCZOS)
-            self.start_icon_tk = ImageTk.PhotoImage(self.start_icon)
+    def _load_icons(self):
+        self.start_icon = self._load_icon("icon.png")
+        self.hover_icon = self._load_icon("icon_hover.png") or self.start_icon
 
-            # Load and resize the hover icon
-            self.hover_icon = Image.open(resource_path("assets/icon_hover.png"))
-            self.hover_icon = self.hover_icon.resize((128, 128), Image.Resampling.LANCZOS)
-            self.hover_icon_tk = ImageTk.PhotoImage(self.hover_icon)
+    def _build_ui(self):
+        self.root.title("Simply Capture")
+        self.root.geometry("520x430")
+        self.root.minsize(440, 390)
+        self.root.configure(bg="#202225")
 
-            # Load and resize the stop icon (using the same icon.png for simplicity)
-            self.stop_icon = Image.open(resource_path("assets/icon.png"))
-            self.stop_icon = self.stop_icon.resize((128, 128), Image.Resampling.LANCZOS)
-            self.stop_icon_tk = ImageTk.PhotoImage(self.stop_icon)
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure(".", background="#202225", foreground="#f2f3f5", font=("Segoe UI", 10))
+        style.configure("TButton", background="#35373c", padding=8)
+        style.map("TButton", background=[("active", "#5865f2")])
+        style.configure("TLabel", background="#202225", foreground="#b5bac1")
 
-        except Exception as e:
-            messagebox.showerror("Image Loading Error", f"Error loading images: {e}")
-            self.root.destroy()
+        frame = ttk.Frame(self.root, padding=24)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Simply Capture", font=("Segoe UI", 20, "bold")).pack(pady=(0, 16))
 
-    def init_gui(self):
-        # Set window title and icon
-        self.root.title("Screen Recorder")
-        try:
-            self.root.iconphoto(False, self.start_icon_tk)
-        except Exception as e:
-            print(f"Error setting window icon: {e}")
+        ttk.Button(frame, text="Choose output folder", command=self.choose_output_directory).pack(fill="x")
+        self.folder_label = ttk.Label(frame, text=str(self.output_directory), wraplength=450)
+        self.folder_label.pack(fill="x", pady=(6, 14))
 
-        # Set window size and background color
-        self.root.geometry("500x400")
-        self.root.configure(bg="#313338")
+        controls = ttk.Frame(frame)
+        controls.pack(fill="x")
+        ttk.Button(controls, text="Select recording region", command=self.select_region).pack(side="left", expand=True, fill="x")
+        ttk.Label(controls, text="FPS").pack(side="left", padx=(12, 4))
+        self.fps_variable = tk.StringVar(value="20")
+        ttk.Spinbox(controls, from_=1, to=60, width=5, textvariable=self.fps_variable).pack(side="left")
 
-        # Set up ttk style
-        self.style = ttk.Style()
-        self.set_theme("dark")
+        self.region_label = ttk.Label(frame, text="No region selected")
+        self.region_label.pack(pady=14)
 
-        # Browse Save Folder Button
-        self.browse_button = ttk.Button(self.root, text="Browse Save Folder", command=self.browse_folder)
-        self.browse_button.pack(pady=10)
+        if self.start_icon:
+            self.record_button = ttk.Button(frame, image=self.start_icon, command=self.toggle_recording)
+        else:
+            self.record_button = ttk.Button(frame, text="Start recording", command=self.toggle_recording)
+        self.record_button.pack(pady=8)
 
-        # Display selected save folder
-        self.folder_label = ttk.Label(self.root, text=f"Save Folder: {self.save_folder}", wraplength=480, justify="left", foreground="#949ba4", background="#313338")
-        self.folder_label.pack(pady=5)
+        self.status_label = ttk.Label(frame, text="Idle")
+        self.status_label.pack(pady=8)
+        ttk.Label(frame, text="Ctrl+Shift+S starts or stops recording while this app is focused.").pack()
 
-        # Select Recording Region Button
-        self.select_region_button = ttk.Button(self.root, text="Select Recording Region", command=self.select_region)
-        self.select_region_button.pack(pady=10)
-
-        # Start/Stop Recording Button (Icon Button)
-        self.record_button = ttk.Label(self.root, image=self.start_icon_tk, cursor="hand2")
-        self.record_button.pack(pady=20)
-        self.record_button.bind("<Button-1>", self.toggle_recording)
-        self.record_button.bind("<Enter>", self.on_hover)
-        self.record_button.bind("<Leave>", self.on_leave)
-
-        # Status Label
-        self.status_label = ttk.Label(self.root, text="Status: Idle", foreground="#949ba4", background="#313338")
-        self.status_label.pack(pady=10)
-
-        # Apply additional style configurations
-        self.style.configure("TButton",
-                             background="#383a40",
-                             foreground="#949ba4",
-                             borderwidth=0,
-                             focusthickness=3,
-                             focuscolor="#726d95")
-        self.style.map("TButton",
-                       background=[('active', '#726d95')],
-                       foreground=[('active', '#ffffff')])
-
-    def set_theme(self, mode):
-        if mode == "dark":
-            self.style.theme_use("clam")
-
-            # Configure colors
-            self.style.configure('.', 
-                                 background="#313338",
-                                 foreground="#949ba4",
-                                 font=("Segoe UI", 10),
-                                 bordercolor="#383a40")
-            self.style.configure('TButton', 
-                                 background="#383a40",
-                                 foreground="#949ba4",
-                                 borderwidth=1,
-                                 focusthickness=3,
-                                 focuscolor="#726d95")
-
-            self.style.map('TButton',
-                           background=[('active', '#726d95')],
-                           foreground=[('active', '#ffffff')])
-
-            # Configure labels
-            self.style.configure('TLabel',
-                                 background="#313338",
-                                 foreground="#949ba4")
-
-    def browse_folder(self):
-        folder_selected = filedialog.askdirectory()
-        if folder_selected:
-            self.save_folder = folder_selected
-            self.folder_label.config(text=f"Save Folder: {self.save_folder}")
+    def choose_output_directory(self):
+        selected = filedialog.askdirectory(initialdir=self.output_directory)
+        if selected:
+            self.output_directory = Path(selected)
+            self.folder_label.configure(text=str(self.output_directory))
 
     def select_region(self):
-        self.root.withdraw()  # Hide main window during selection
-        selection_window = tk.Toplevel()
-        selection_window.attributes("-fullscreen", True)
-        selection_window.attributes("-alpha", 0.3)
-        selection_window.configure(background='black')
-        selection_window.bind("<ButtonPress-1>", self.on_mouse_down)
-        selection_window.bind("<B1-Motion>", self.on_mouse_move)
-        selection_window.bind("<ButtonRelease-1>", self.on_mouse_up)
+        if self.recording:
+            messagebox.showwarning("Recording active", "Stop the recording before changing the region.")
+            return
+        self.root.withdraw()
+        window = tk.Toplevel(self.root)
+        window.attributes("-fullscreen", True)
+        window.attributes("-alpha", 0.3)
+        window.configure(bg="black")
+        window.bind("<Escape>", lambda _event: self._cancel_selection())
 
-        self.start_x = self.start_y = self.end_x = self.end_y = 0
-        self.rect = None
-        self.selection_canvas = tk.Canvas(selection_window, cursor="cross", bg="black")
-        self.selection_canvas.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(window, cursor="cross", bg="black", highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+        canvas.bind("<ButtonPress-1>", self._selection_started)
+        canvas.bind("<B1-Motion>", self._selection_moved)
+        canvas.bind("<ButtonRelease-1>", self._selection_finished)
+        canvas.focus_set()
+        self.selection_window = window
+        self.selection_canvas = canvas
 
-        self.selection_canvas.bind("<Escape>", lambda e: self.cancel_selection(selection_window))
+    def _selection_started(self, event):
+        self.selection_start = (event.x_root, event.y_root)
+        self.selection_rectangle = self.selection_canvas.create_rectangle(
+            event.x, event.y, event.x, event.y, outline="#ff4d4d", width=2
+        )
 
-        self.selection_window = selection_window
-        self.selection_canvas.focus_set()
-        selection_window.mainloop()
+    def _selection_moved(self, event):
+        if self.selection_rectangle is not None:
+            start_x = self.selection_start[0] - self.selection_window.winfo_rootx()
+            start_y = self.selection_start[1] - self.selection_window.winfo_rooty()
+            self.selection_canvas.coords(self.selection_rectangle, start_x, start_y, event.x, event.y)
 
-    def on_mouse_down(self, event):
-        self.start_x = event.x
-        self.start_y = event.y
-        self.rect = self.selection_canvas.create_rectangle(self.start_x, self.start_y, self.start_x, self.start_y, outline='red', width=2)
+    def _selection_finished(self, event):
+        try:
+            self.region = normalize_region(*self.selection_start, event.x_root, event.y_root)
+        except ValueError as exc:
+            self._close_selection()
+            messagebox.showerror("Invalid region", str(exc))
+            return
+        self._close_selection()
+        self.region_label.configure(
+            text=f"{self.region.width}×{self.region.height} at ({self.region.left}, {self.region.top})"
+        )
+        self.status_label.configure(text="Region ready")
 
-    def on_mouse_move(self, event):
-        current_x, current_y = event.x, event.y
-        self.selection_canvas.coords(self.rect, self.start_x, self.start_y, current_x, current_y)
+    def _cancel_selection(self):
+        self._close_selection()
+        self.status_label.configure(text="Selection cancelled")
 
-    def on_mouse_up(self, event):
-        self.end_x = event.x
-        self.end_y = event.y
-        self.selection_window.destroy()
+    def _close_selection(self):
+        if self.selection_window is not None:
+            self.selection_window.destroy()
+        self.selection_window = None
+        self.selection_canvas = None
+        self.selection_rectangle = None
         self.root.deiconify()
 
-        # Calculate region
-        left = min(self.start_x, self.end_x)
-        top = min(self.start_y, self.end_y)
-        width = abs(self.end_x - self.start_x)
-        height = abs(self.end_y - self.start_y)
-
-        self.region = {
-            "top": top,
-            "left": left,
-            "width": width,
-            "height": height
-        }
-        self.status_label.config(text=f"Selected Region: {self.region}")
-        self.record_button.config(state="normal")
-        messagebox.showinfo("Region Selected", f"Recording region set to: {self.region}")
-
-    def cancel_selection(self, window):
-        window.destroy()
-        self.root.deiconify()
-        messagebox.showinfo("Selection Cancelled", "Region selection was cancelled.")
-
-    def toggle_recording(self, event=None):
-        if not self.recording:
+    def toggle_recording(self, _event=None):
+        if self.worker is None:
             self.start_recording()
-        else:
+        elif not self.stop_event.is_set():
             self.stop_recording()
 
     def start_recording(self):
-        if not self.region:
-            messagebox.showerror("Error", "Please select a region before starting the recording.")
+        if self.region is None:
+            messagebox.showerror("No region", "Select a recording region first.")
+            return
+        try:
+            fps = validate_fps(self.fps_variable.get())
+            output_file = recording_path(self.output_directory)
+        except ValueError as exc:
+            messagebox.showerror("Invalid settings", str(exc))
             return
 
-        self.recording = True
-        self.status_label.config(text="Status: Recording", foreground="#726d95")
-        self.update_record_button()
-
-        self.recording_thread = threading.Thread(target=self.record_screen)
-        self.recording_thread.start()
+        self.stop_event.clear()
+        self.worker = CaptureWorker(self.region, output_file, fps, self.stop_event, self.events)
+        self.worker.start()
+        self.status_label.configure(text=f"Recording {output_file.name}")
+        self._set_button_state(True)
 
     def stop_recording(self):
-        if self.recording:
-            self.recording = False
-            self.status_label.config(text="Status: Stopped", foreground="#949ba4")
-            self.update_record_button()
+        if self.worker is not None:
+            self.stop_event.set()
+            self.status_label.configure(text="Finishing recording…")
+            self.record_button.configure(state="disabled")
 
-    def update_record_button(self):
-        if self.recording:
-            self.record_button.config(image=self.stop_icon_tk)
+    def _set_button_state(self, recording: bool):
+        if self.start_icon:
+            self.record_button.configure(image=self.hover_icon if recording else self.start_icon)
         else:
-            self.record_button.config(image=self.start_icon_tk)
+            self.record_button.configure(text="Stop recording" if recording else "Start recording")
 
-    def on_hover(self, event):
-        if not self.recording:
-            self.record_button.config(image=self.hover_icon_tk)
+    def _poll_events(self):
+        try:
+            while True:
+                event = self.events.get_nowait()
+                if event[0] == "saved":
+                    _, output_file, frames = event
+                    self.worker = None
+                    self.stop_event.clear()
+                    self.record_button.configure(state="normal")
+                    self._set_button_state(False)
+                    self.status_label.configure(text=f"Saved {frames:,} frames to {output_file.name}")
+                elif event[0] == "error":
+                    self.worker = None
+                    self.stop_event.clear()
+                    self.record_button.configure(state="normal")
+                    self._set_button_state(False)
+                    messagebox.showerror("Recording error", event[1])
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_events)
 
-    def on_leave(self, event):
-        if not self.recording:
-            self.record_button.config(image=self.start_icon_tk)
+    def on_close(self):
+        if self.worker is not None and self.worker.is_alive():
+            if not messagebox.askokcancel("Quit", "Stop the active recording and quit?"):
+                return
+            self.stop_event.set()
+            self.worker.join(timeout=2)
+        self.root.destroy()
 
-    def record_screen(self):
-        # Generate filename with current date and time
-        timestamp = datetime.datetime.now().strftime("%m%d%y_%H%M%S")
-        filename = f"screenrecording_{timestamp}.avi"
-        filepath = os.path.join(self.save_folder, filename)
 
-        # Define the codec and create VideoWriter object
-        codec = cv2.VideoWriter_fourcc(*"XVID")
-        out = cv2.VideoWriter(filepath, codec, self.fps, (self.region["width"], self.region["height"]))
+def main():
+    os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_MSMF", "0")
+    root = tk.Tk()
+    ScreenRecorder(root)
+    root.mainloop()
 
-        with mss.mss() as sct:
-            try:
-                last_time = time.time()
-                while self.recording:
-                    # Capture the screen
-                    img = sct.grab(self.region)
-                    # Convert to a format suitable for OpenCV
-                    frame = np.array(img)
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                    # Write the frame
-                    out.write(frame)
-
-                    # Maintain the desired FPS
-                    elapsed = time.time() - last_time
-                    time_to_sleep = max(0, (1 / self.fps) - elapsed)
-                    time.sleep(time_to_sleep)
-                    last_time = time.time()
-            except Exception as e:
-                messagebox.showerror("Recording Error", f"An error occurred during recording: {e}")
-            finally:
-                out.release()
-                cv2.destroyAllWindows()
-                if not self.recording:
-                    self.status_label.config(text=f"Recording saved as {filename}", foreground="#949ba4")
-                else:
-                    self.status_label.config(text="Recording stopped unexpectedly.", foreground="#726d95")
-
-    def on_closing(self):
-        if self.recording:
-            if messagebox.askokcancel("Quit", "Recording is in progress. Do you want to quit?"):
-                self.recording = False
-                self.root.destroy()
-        else:
-            self.root.destroy()
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = ScreenRecorder(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_closing)
-    root.mainloop()
+    main()
