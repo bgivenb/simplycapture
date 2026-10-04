@@ -3,3 +3,9 @@ __pycache__/
 .venv/
 *.mp4
 .DS_Store
+
+.venv/
+build/
+dist/
+*.spec
+build-output.log

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Simply Capture</title>
+  <rect x="4" y="4" width="248" height="248" rx="58" fill="#191d2b"/>
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="none" stroke="#39334f" stroke-width="2"/>
+  <path d="M92 60H64V88 M164 60H192V88 M64 168V196H92 M192 168V196H164" fill="none" stroke="#b99afa" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="128" cy="128" r="31" fill="#e8b3eb"/>
+</svg>
