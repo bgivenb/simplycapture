@@ -45,9 +45,16 @@ def validate_fps(fps: float) -> float:
     return value
 
 
-def recording_path(folder: Union[str, Path], now: Optional[datetime] = None) -> Path:
+def recording_path(folder: Union[str, Path], now: Optional[datetime] = None, prefix="simply-capture", extension=".mp4") -> Path:
     directory = Path(folder).expanduser().resolve()
     if not directory.is_dir():
         raise ValueError("Choose an existing output directory.")
     timestamp = (now or datetime.now()).strftime("%Y%m%d-%H%M%S")
-    return directory / f"simply-capture-{timestamp}.mp4"
+    from app_state import safe_prefix
+    stem = f"{safe_prefix(prefix)}-{timestamp}"
+    path = directory / f"{stem}{extension}"
+    counter = 2
+    while path.exists() or path.with_name(path.stem + ".partial.mp4").exists():
+        path = directory / f"{stem}-{counter}{extension}"
+        counter += 1
+    return path
